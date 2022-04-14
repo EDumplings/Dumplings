@@ -1,0 +1,78 @@
+Redis是单线程，线程安全只要保证命令是原子性，在Redis中原子性指令会按照顺序执行。
+
+```java
+/**
+redis 预减库存。
+decrement & increment 原子性--1, ++1;
+*/
+@Override
+public Long preDecStock(Long goodsId) {
+    // 查看内存标记，减少Redis访问
+    if(empytStockMap.get(goodsId)){
+        return -1L;
+    }
+    ValueOperations valueOperations = redisTemplate.opsForValue();
+    Long stock = (Long) valueOperations.decrement("seckillGoods:" + goodsId);
+    if(stock < 0){
+        empytStockMap.put(goodsId, true);
+        // 保证Redis里的库存为0。有多少个请求在小于0时多减一，就会有多少个请求进入加回来，最终等于0
+        valueOperations.increment("seckillGoods:" + goodsId);
+        return -1L;
+    }
+    return stock;
+
+}
+```
+
+问题：保证Redis里面库存为0时，在去执行increment方法时，可能导致网络等原因导致请求丢失，无法保证increment执行。库存和数据库里面数据不一致。
+
+使用lua脚本，lua脚本是在Redis中整体原子性执行。
+
+lua脚本
+
+```lua
+--[[
+KEYS[] 键集合。KEYS[1] 键值中的第一个。
+]]
+if(redis.call('exists', KEYS[1]) == 1) then
+    local stock = tonumber(redis.call('get', KEYS[1]));
+    if(stock > 0) then
+        redis.call('incrby', KEYS[1], -1);
+        return stock;
+    end;
+    return 0;
+end; 
+```
+
+```java
+/** 加载lua脚本 */
+@Bean
+public DefaultRedisScript<Long> script(){
+    DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>();
+    redisScript.setLocation(new ClassPathResource("stock.lua"));
+    redisScript.setResultType(Long.class);
+    return redisScript;
+}
+```
+
+```java
+@Override
+public Long preDecStock(Long goodsId) {
+    // 查看内存标记，减少Redis访问
+    if(empytStockMap.get(goodsId)){
+        return -1L;
+    }
+    Long stock = (Long)redisTemplate.execute(script, Collections.singletonList("seckillGoods:" + goodsId), Collections.EMPTY_LIST);
+    if(stock < 0){
+        empytStockMap.put(goodsId, true);
+        return -1L;
+    }
+    return stock;
+
+}
+```
+
+redisTemplate.execute(RedisScript<T> script, List<String> keys, Object args[])
+
+参数：script 加载lua脚本的对象，keys 键的集合列表，args 设置Redis中时间参数。
+
